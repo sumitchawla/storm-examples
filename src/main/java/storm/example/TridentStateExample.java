@@ -107,7 +107,7 @@ public class TridentStateExample  {
         }
 
         public void complete(CountState state, TridentCollector collector) {
-            LOG.info(String.format("Commiting counts for Constituency %d - Democracts %d Republican %d for Batch %s",
+            LOG.debug(String.format("Emitting counts for Constituency %d - Democracts %d Republican %d for Batch %s",
                     state.constituencyId, state.state.DemocratsVotes, state.state.RepublicanVotes, _batchId));
             collector.emit(new Values(state.state));
         }
@@ -137,13 +137,14 @@ public class TridentStateExample  {
                 Integer constituencyId = constituencyList.get(i);
                 ConstituencyState batchUpdateForConstituency = batchStates.get(i);
                 if (!totalCount.containsKey(constituencyId)){
-                    totalCount.put(constituencyId, new ConstituencyState());
+                   totalCount.put(constituencyId, new ConstituencyState());
                 }
 
                 ConstituencyState totalCountsForConstituency = totalCount.get(constituencyId);
                 totalCountsForConstituency.DemocratsVotes += batchUpdateForConstituency.DemocratsVotes;
                 totalCountsForConstituency.RepublicanVotes+= batchUpdateForConstituency.RepublicanVotes;
-
+                LOG.debug(String.format("Commited counts for Constituency %d - Current Counts - Democrats %d Republican %d ",
+                        constituencyId, totalCountsForConstituency.DemocratsVotes, totalCountsForConstituency.RepublicanVotes));
             }
         }
 
@@ -152,6 +153,7 @@ public class TridentStateExample  {
             List<ConstituencyState> states = new ArrayList<ConstituencyState>();
             for(int i=0; i<constituencyList.size(); i++) {
                 Integer constituencyId = constituencyList.get(i);
+                LOG.debug(String.format("GET for %d", constituencyId));
                 if (totalCount.containsKey(constituencyId)) {
                     states.add(totalCount.get(constituencyId));
                 } else {
@@ -161,12 +163,37 @@ public class TridentStateExample  {
             return states;
         }
 
+        public List<ConstituencyState> getAllCounts()
+        {
+            return new ArrayList<ConstituencyState>(totalCount.values());
+        }
+
         public void beginCommit(Long aLong) {
 
         }
 
         public void commit(Long aLong) {
 
+        }
+    }
+
+
+    public static class StateUpdater extends BaseStateUpdater<ElectionState> {
+        public void updateState(ElectionState state, List<TridentTuple> tuples, TridentCollector collector) {
+            List<Integer> ids = new ArrayList<Integer>();
+            List<ConstituencyState> states = new ArrayList<ConstituencyState>();
+            for(TridentTuple t: tuples) {
+                //System.out.println(t);
+                ids.add(t.getInteger(0));
+                states.add((ConstituencyState) t.get(1));
+            }
+            state.setStateValues(ids, states);
+        }
+    }
+
+    public static class StateUpdaterFactory implements StateFactory {
+        public storm.trident.state.State makeState(Map conf, IMetricsContext metricsContext, int partitionIndex, int numPartitions) {
+            return new ElectionState();
         }
     }
 
@@ -217,22 +244,30 @@ public class TridentStateExample  {
         }
     }
 
-    public static class StateUpdater extends BaseStateUpdater<ElectionState> {
-        public void updateState(ElectionState state, List<TridentTuple> tuples, TridentCollector collector) {
+    public static class QueryElectionLeader
+            extends BaseQueryFunction<ElectionState, Object> {
+        public List<Object> batchRetrieve(ElectionState state, List<TridentTuple> inputs) {
             List<Integer> ids = new ArrayList<Integer>();
-            List<ConstituencyState> states = new ArrayList<ConstituencyState>();
-            for(TridentTuple t: tuples) {
-                //System.out.println(t);
-                ids.add(t.getInteger(0));
-                states.add((ConstituencyState) t.get(1));
+            List<Object> result = new ArrayList<Object>();
+            List<ConstituencyState> currentStates = state.getAllCounts();
+            Long democratsLeadingCount = 0L;
+            Long republicansLeadingCount = 0L;
+            for(ConstituencyState constituencyState : currentStates ) {
+                if (constituencyState.DemocratsVotes > constituencyState.RepublicanVotes) {
+                    democratsLeadingCount++;
+                } else {
+                    republicansLeadingCount++;
+                }
             }
-            state.setStateValues(ids, states);
+            Map<String, Long> map = new HashMap<String, Long>();
+            map.put(PartyName.Democratic.toString(), democratsLeadingCount);
+            map.put(PartyName.Republican.toString(), republicansLeadingCount);
+            result.add(map);
+            return result;
         }
-    }
 
-    public static class StateUpdaterFactory implements StateFactory {
-        public storm.trident.state.State makeState(Map conf, IMetricsContext metricsContext, int partitionIndex, int numPartitions) {
-            return new ElectionState();
+        public void execute(TridentTuple tuple, Object result, TridentCollector collector) {
+            collector.emit(new Values(result));
         }
     }
 
@@ -242,12 +277,12 @@ public class TridentStateExample  {
         TridentState loginCounts =
                 topology.newStream("voting-events", new RandomVoteSpout())
                         .name("VoteStream")
-                        .parallelismHint(4)
+                        .parallelismHint(100)
                         .groupBy(new Fields("ConstituencyId"))
                         .aggregate(new Fields("PartyName", "ConstituencyId"), new VoteCountAggregator(), new Fields("count"))
                         .name("CountAggregator")
                         .partitionPersist(new StateUpdaterFactory(), new Fields("ConstituencyId", "count"), new StateUpdater())
-                        .parallelismHint(5);
+                        .parallelismHint(1); // Single Partition Persist
 
         LocalDRPC drpc = new LocalDRPC();
 
@@ -255,6 +290,9 @@ public class TridentStateExample  {
                 .stateQuery(loginCounts, new Fields("args"), new QueryConstituencyCount(), new Fields("count"))
                 .each(new Fields("count"), new FilterNull());
 
+        topology.newDRPCStream("leader", drpc)
+                .stateQuery(loginCounts, new Fields("args"), new QueryElectionLeader(), new Fields("count"))
+                .each(new Fields("count"), new FilterNull());
 
         LocalCluster cluster = new LocalCluster();
 
@@ -264,7 +302,8 @@ public class TridentStateExample  {
                 topology.build());
 
         for (int i = 0; i < 1000; i++) {
-            System.out.println(drpc.execute("count", "1"));
+            System.out.println(String.format("Current Counts for Constituency %s", drpc.execute("count", "1")));
+            System.out.println(String.format("Current Election Counts %s", drpc.execute("leader", "")));
             Utils.sleep(2000);
         }
         cluster.shutdown();
